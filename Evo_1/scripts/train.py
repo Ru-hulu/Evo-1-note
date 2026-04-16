@@ -449,7 +449,8 @@ def train(config):
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
 
                 pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask)
-                
+                # 输入 语义信息，机器人的状态，真实动作
+                # 输出 随机noise 从noise状态下向target移动的 预测速度
             target_velocity = (actions_gt - noise).view(actions_gt.shape[0], -1)
             
             assert pred_velocity.shape == target_velocity.shape
@@ -463,7 +464,7 @@ def train(config):
 
             action_mask = action_mask.view(action_mask.shape[0], -1).to(dtype=pred_velocity.dtype)
             pred_velocity_mask = pred_velocity * action_mask
-            loss = loss_fn(pred_velocity_mask, target_velocity)
+            loss = loss_fn(pred_velocity_mask, target_velocity) ## flow matching 模型损失计算的位置
             scale_factor = action_mask.numel() / (action_mask.sum() + 1e-8)
             loss = loss * scale_factor
             

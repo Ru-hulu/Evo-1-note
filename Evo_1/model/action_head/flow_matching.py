@@ -4,24 +4,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, dim: int, max_len: int = 1000):
+class SinusoidalPositionalEncoding(nn.Module): ## 给动作序列的时间步位置编码
+    def __init__(self, dim: int, max_len: int = 1000): ## dim 896 max_len 1000
         super().__init__()
-        pe = torch.zeros(max_len, dim)
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2) * -(math.log(10000.0) / dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  
+        pe = torch.zeros(max_len, dim) # 1. 创建一个全 0 的位置编码矩阵，形状 [max_len, dim]
+        position = torch.arange(0, max_len).unsqueeze(1) # 2. 生成位置索引：0,1,2,...,999 [max_len] -> 形状变成 [max_len, 1]
+        div_term = torch.exp(torch.arange(0, dim, 2) * -(math.log(10000.0) / dim)) # \frac{1}   {10000^{\frac{2i}{d_{model}}}}
+        pe[:, 0::2] = torch.sin(position * div_term) ## 2i的位置编码
+        pe[:, 1::2] = torch.cos(position * div_term) ## 2i+1的位置编码
+        pe = pe.unsqueeze(0)  ## [max_len, dim]->[1, max_len, dim]
         self.register_buffer('pe', pe)
 
-    def forward(self, seq_len: int):
+    def forward(self, seq_len: int): ## 如果传入的维度大于了pe的max_len，那么位置编码是不够长的，会把 pe维度从 [1,1000,896] -> [1,more,896]
         if seq_len > self.pe.size(1):
             self._extend_pe(seq_len)
         return self.pe[:, :seq_len, :]
 
     def _extend_pe(self, new_max_len):
-        old_max_len, dim = self.pe.size(1), self.pe.size(2)
+        old_max_len, dim = self.pe.size(1), self.pe.size(2) ## size(0) = 1 size(1) = 1000（旧的最大长度） size(2) = 896（编码维度）
         if new_max_len <= old_max_len:
             return
         extra_positions = torch.arange(old_max_len, new_max_len, dtype=torch.float).unsqueeze(1)
@@ -33,14 +33,16 @@ class SinusoidalPositionalEncoding(nn.Module):
         new_pe = torch.cat([self.pe, extra_pe.to(self.pe.device)], dim=1)
         self.pe = new_pe
 
-class CategorySpecificLinear(nn.Module):
+class CategorySpecificLinear(nn.Module):  ## 可以理解为一个线性层,作了线性变换 x->ax+b->out
     def __init__(self, in_dim: int, out_dim: int, num_categories: int = 1):
         super().__init__()
         self.num_categories = num_categories
         if num_categories <= 1:
             self.linear = nn.Linear(in_dim, out_dim)
         else:
+            # 形状：[num_categories, in_dim, out_dim] 每个类别都有一个独立的 [in_dim, out_dim] 矩阵
             self.weight = nn.Parameter(torch.randn(num_categories, in_dim, out_dim))
+            # 形状：[num_categories, out_dim] 每个类别都有一个独立的 [out_dim] 偏置
             self.bias = nn.Parameter(torch.randn(num_categories, out_dim))
 
     def forward(self, x: torch.Tensor, category_id: torch.LongTensor):
@@ -48,22 +50,25 @@ class CategorySpecificLinear(nn.Module):
         if self.num_categories <= 1:
             return self.linear(x)
 
-        orig_shape = x.shape
-        x_flat = x.reshape(-1, orig_shape[-1]) 
-        if category_id.dim() == 0:
-       
+        orig_shape = x.shape ## 例如 x.shape = [Batch, 序列长度, 维度] [8, 100, 896]
+        x_flat = x.reshape(-1, orig_shape[-1]) # x.reshape(-1, 896)->[8*100 896]        
+        if category_id.dim() == 0:       
             cid = category_id.item()
             out = x_flat @ self.weight[cid] + self.bias[cid]
         else:
-           
-            category_id = category_id.view(-1)  
-            weight_selected = self.weight[category_id]        
-            bias_selected = self.bias[category_id]        
+            # x_flat.shape = [B, in_dim]
+            # category_id.shape = [B]（每个样本对应 1 个类别）
+            # self.weight.shape = [num_categories, in_dim, out_dim]
+            # self.bias.shape = [num_categories, out_dim]
+            category_id = category_id.view(-1)  # 把类别 ID 张量展平成一维，为[B]
+            weight_selected = self.weight[category_id] # [B, in_dim, out_dim]
+            bias_selected = self.bias[category_id] # [B, out_dim]
             out = torch.bmm(x_flat.unsqueeze(1), weight_selected).squeeze(1) + bias_selected
+            # bmm([B, in_dim]->[B, 1, in_dim], [B, in_dim, out_dim]) ->[B, 1, out_dim]->squeeze(1) -> [B, out_dim]
         out_shape = orig_shape[:-1] + (out.shape[-1],)
         return out.view(out_shape)
 
-class CategorySpecificMLP(nn.Module):
+class CategorySpecificMLP(nn.Module): ## 堆了一个两层 CategorySpecificLinear: x->线性变换->ReLU->线性变换->out
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_categories: int = 1):
         super().__init__()
@@ -76,7 +81,7 @@ class CategorySpecificMLP(nn.Module):
         out = self.fc2(out, category_id)
         return out
 
-class MultiEmbodimentActionEncoder(nn.Module):
+class MultiEmbodimentActionEncoder(nn.Module): ## 把动作序列 action_seq 编码成 token 序列。
 
     def __init__(self, action_dim: int, embed_dim: int, hidden_dim: int, horizon: int, num_categories: int = 1):
         super().__init__()
@@ -88,32 +93,30 @@ class MultiEmbodimentActionEncoder(nn.Module):
         self.W2 = CategorySpecificLinear(hidden_dim, hidden_dim, num_categories)
         self.W3 = CategorySpecificLinear(hidden_dim, embed_dim, num_categories)
    
-        self.pos_encoding = SinusoidalPositionalEncoding(hidden_dim, max_len=horizon)
+        self.pos_encoding = SinusoidalPositionalEncoding(hidden_dim, max_len=horizon) ## 输出为[1, horizon, hidden_dim]
         self.activation = nn.ReLU(inplace=True)
 
     def forward(self, action_seq: torch.Tensor, category_id: torch.LongTensor):
 
         B, H, D = action_seq.shape
         assert H == self.horizon, "Action sequence length must match horizon"
-       
-        x = action_seq.reshape(B * H, D) 
-      
+        
+        x = action_seq.reshape(B * H, D)
+        # 对于tensor dim = 0 不是列表，不是数组，就是一个单独的数字 不能用 category_id[0] 取值
         if category_id.dim() == 0:
-           
-            cat_ids = category_id.repeat(H * B)
+            cat_ids = category_id.repeat(H * B) # -> [H*B]，从0维变1维。不是[1,H*B]
         else:
-            cat_ids = category_id.unsqueeze(1).repeat(1, H).reshape(B * H)
-        out = self.activation(self.W1(x, cat_ids))            
-    
-        pos_enc = self.pos_encoding(H).to(out.device)       
-        pos_enc = pos_enc.repeat(B, 1, 1).reshape(B * H, -1) 
-        out = out + pos_enc
-        out = self.activation(self.W2(out, cat_ids))         
-        out = self.W3(out, cat_ids)                        
-        out = out.view(B, H, self.embed_dim)
+            cat_ids = category_id.unsqueeze(1).repeat(1, H).reshape(B * H) # [B]->[B,1]->[B,H]->[B*H]
+        out = self.activation(self.W1(x, cat_ids)) # 输入 [B*H, D] [B*H] 输出 [B*H, hidden_dim]
+        pos_enc = self.pos_encoding(H).to(out.device) ## 等价于 self.pos_encoding.forward(H)->[1, H, hidden_dim]
+        pos_enc = pos_enc.repeat(B, 1, 1).reshape(B * H, -1) # 变成 [B*H, hidden_dim]
+        out = out + pos_enc # 数值相加
+        out = self.activation(self.W2(out, cat_ids)) # 输入 [B*H, hidden_dim] [B*H] 输出 [B*H, hidden_dim]
+        out = self.W3(out, cat_ids) # 输入 [B*H, hidden_dim] [B*H] 输出 [B*H, embed_dim]               
+        out = out.view(B, H, self.embed_dim) # [B, H, embed_dim]
         return out
 
-class BasicTransformerBlock(nn.Module):
+class BasicTransformerBlock(nn.Module): ## 动作 token 对上下文 token 的 cross-attention。
 
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
@@ -130,11 +133,10 @@ class BasicTransformerBlock(nn.Module):
 
         x = self.norm1(action_tokens)
         attn_out, _ = self.attn(x, context_tokens, context_tokens)
-
+        ##Q = x K = context_tokens V = context_tokens
         x = action_tokens + attn_out
-
         x2 = self.norm2(x)
-
+        # transformer 中 Feed-Forward部分
         if time_emb is not None:
             x2 = x2 + time_emb.unsqueeze(1)
         ff_out = self.ff(x2)
@@ -143,6 +145,7 @@ class BasicTransformerBlock(nn.Module):
 
 class FlowmatchingActionHead(nn.Module):
 
+    # 没有什么作用，只是做了一些模块定义
     def __init__(self, config=None,
                  embed_dim: int = 896, 
                  hidden_dim: int = 1024,
@@ -181,8 +184,17 @@ class FlowmatchingActionHead(nn.Module):
         self.per_action_dim = config.per_action_dim
         self.action_dim = config.action_dim
 
+        # get("embed_dim", 896),    
+        # .get("hidden_dim", 1024),
+        # get("state_dim", 7),
+        # config.get("state_hidden_dim", 1024),
+        # g.get("num_heads", 8),
+        # ig.get("num_layers", 8),
+        # get("dropout", 0.0),
+        # ("num_inference_timesteps", 50),
+        # ("num_categories", 1)
 
-        self.time_pos_enc = SinusoidalPositionalEncoding(embed_dim, max_len=1000)
+        self.time_pos_enc = SinusoidalPositionalEncoding(embed_dim, max_len=1000) ## 默认参数 896
 
         self.transformer_blocks = nn.ModuleList([
             BasicTransformerBlock(embed_dim=embed_dim, num_heads=num_heads,
@@ -205,61 +217,53 @@ class FlowmatchingActionHead(nn.Module):
                                                     hidden_dim=state_hidden,
                                                     output_dim=embed_dim,
                                                     num_categories=num_categories)
-
+            # (num_categories, embed_dim)
         self.action_encoder = None
         if horizon > 1:
           
             per_action_dim = getattr(self.config, "per_action_dim", None)
             if per_action_dim is None:
-            
-                per_action_dim = action_dim // horizon if action_dim % horizon == 0 else action_dim
+                per_action_dim = action_dim // horizon if action_dim % horizon == 0 else action_dim ## 这么写 // 是为了保证是整数
             self.action_encoder = MultiEmbodimentActionEncoder(action_dim=per_action_dim,
                                                                embed_dim=embed_dim,
                                                                hidden_dim=embed_dim,  
                                                                horizon=horizon,
                                                                num_categories=num_categories)
 
+    # 前向传播（训练用）
     def forward(self, fused_tokens: torch.Tensor, state: torch.Tensor = None,
                 actions_gt: torch.Tensor = None, embodiment_id: torch.LongTensor = None, 
                 state_mask: torch.Tensor = None, action_mask: torch.Tensor = None):
 
         if actions_gt is None:
             return self.get_action(fused_tokens, state=state, embodiment_id=embodiment_id)
-        B = fused_tokens.size(0)
+        B = fused_tokens.size(0) # 批次大小 B, H, D 
         device = fused_tokens.device
-
+        # 如果没有传入类别ID，默认全0
         if embodiment_id is None:
             embodiment_id = torch.zeros(B, dtype=torch.long, device=device)
 
         context_tokens = fused_tokens 
         if state is not None and self.state_encoder is not None:
-
-
-            state_emb = self.state_encoder(state, embodiment_id)  
-            state_emb = state_emb.unsqueeze(1) 
-
-            context_tokens = torch.cat([context_tokens, state_emb], dim=1) 
+            state_emb = self.state_encoder(state, embodiment_id)  # 对状态进行一次编码 (num_categories, embed_dim)
+            state_emb = state_emb.unsqueeze(1) # (num_categories, 1, embed_dim)
+            context_tokens = torch.cat([context_tokens, state_emb], dim=1) ## state 编码以后和context_tokens拼接
 
         t = torch.distributions.Beta(2, 2).sample((B,)).clamp(0.02, 0.98).to(device).to(dtype=self.dtype)
-
-        
-                    
-        time_index = (t * 1000).long()  
-        time_emb = self.time_pos_enc(1000)[:, time_index, :].squeeze(0) 
-    
+        # 维度是[B],每个数都在[0.02,0.98]之间
+        time_index = (t * 1000).long() # 得到的是[B],但是数值在[2,980]之间，可以理解为B个索引值
+        time_emb = self.time_pos_enc(1000)[:, time_index, :].squeeze(0) ## 时间在这里
+        # [1,1000,embed_dim] ->依据索引选->[1,B,embed_dim]->[B,embed_dim]
         action_shape = actions_gt.shape[1]  
-    
-
-        actions_gt_seq = actions_gt  
+        actions_gt_seq = actions_gt # 真实动作（标签）
 
 
-        noise = torch.rand_like(actions_gt) * 2 - 1  
+        noise = torch.rand_like(actions_gt) * 2 - 1 #actions_gt 形状完全一样的张量，每个值[-1,1]，
 
         if action_mask is not None:
-            action_mask = action_mask.to(dtype=noise.dtype, device=noise.device)
+            action_mask = action_mask.to(dtype=noise.dtype, device=noise.device) # type 是统一数据类型，例如float32
             assert action_mask.shape == noise.shape, f"action_mask shape {action_mask.shape} != noise shape {noise.shape}"
-            noise = noise * action_mask
-
+            noise = noise * action_mask # 对noise 进行mask操作，让噪声只在部分位置生效
 
         if self.horizon > 1:
             noise_seq = noise.view(B, self.horizon, self.per_action_dim)
@@ -268,13 +272,15 @@ class FlowmatchingActionHead(nn.Module):
             noise_seq = noise.unsqueeze(1)
 
         if self.horizon > 1:
-            t_broadcast = t.view(B, 1, 1)
+            t_broadcast = t.view(B, 1, 1) ## 时间在这里
         else:
             t_broadcast = t.view(B, 1)
         action_intermediate_seq = (1 - t_broadcast) * noise_seq + t_broadcast * actions_gt_seq  
-
+        # 对噪声和真实动作进行加权，得到加噪的噪声 
+        # [B,1,1] * [B, self.horizon, self.per_action_dim] + [B,1,1] * [B, self.horizon, self.per_action_dim]
+        # 采样一条从噪声到真实动作的路径上的中间点。
         if self.horizon > 1 and self.action_encoder is not None:
-     
+
             action_tokens = self.action_encoder(action_intermediate_seq, embodiment_id)  
         else:
 
@@ -284,7 +290,7 @@ class FlowmatchingActionHead(nn.Module):
 
         x = action_tokens  
         for block in self.transformer_blocks:
-            x = block(x, context_tokens, time_emb)
+            x = block(x, context_tokens, time_emb) ## 中间态 真实态对应的上下文信息 中间态对应的时间点
 
         x = self.norm_out(x)  
 
@@ -300,10 +306,12 @@ class FlowmatchingActionHead(nn.Module):
           
             x_pooled = x.squeeze(1) 
 
-        pred_velocity = self.mlp_head(x_pooled, embodiment_id) 
+        pred_velocity = self.mlp_head(x_pooled, embodiment_id) ## 预测速度
 
         return pred_velocity, noise
-
+        ## noise 是随即生成的噪声位置
+        ## pre_velocity 是 noise 和 target之间若干个位置，预测的速度向量。
+    # 动作生成 (部署用)
     def get_action(self, fused_tokens: torch.Tensor, state: torch.Tensor = None, embodiment_id: torch.LongTensor = None, action_mask: torch.Tensor = None):
 
         print(f"action_mask shape: {action_mask.shape if action_mask is not None else 'None'}")
@@ -330,7 +338,7 @@ class FlowmatchingActionHead(nn.Module):
         else:
             per_action_dim = action_dim_total
 
-        action = (torch.rand(B, action_dim_total, device=device) * 2 - 1)
+        action = (torch.rand(B, action_dim_total, device=device) * 2 - 1) ## 随即产生的动作
         print(f"action shape: {action.shape}")
         print(f"one sample action: {action[0]}")
 
@@ -376,7 +384,7 @@ class FlowmatchingActionHead(nn.Module):
                     self.single_action_proj = nn.Linear(per_action_dim, self.embed_dim).to(device)
                     action_tokens = self.single_action_proj(action_seq)
 
-            x = action_tokens
+            x = action_tokens  ## 循环一次
             for block in self.transformer_blocks:
                 x = block(x, context_tokens, time_emb)
             x = self.norm_out(x)
@@ -394,10 +402,10 @@ class FlowmatchingActionHead(nn.Module):
          
             pred = self.mlp_head(x_pooled, embodiment_id)  
   
-            action = action + dt * pred
+            action = action + dt * pred  ## 计算一次
           
             if self.horizon > 1:
-                action_seq = action.view(B, self.horizon, per_action_dim)
+                action_seq = action.view(B, self.horizon, per_action_dim) ## 更新一次
             else:
                 action_seq = action.view(B, 1, per_action_dim)
       
