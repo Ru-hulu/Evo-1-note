@@ -201,7 +201,7 @@ class LeRobotDataset(Dataset):
         ])
 
     def _load_metadata(self):
-     
+
         self.episodes = []
         self.tasks = {}
         norm_stats_list = []
@@ -213,6 +213,8 @@ class LeRobotDataset(Dataset):
             norm_arm_list = []
             self.tasks[arm_name] = {}
             for dataset_name, dataset_config in arm_config.items():
+                # 外层 arm_name: metaworld_sawyer
+                # 内层 dataset_name: Evo1_MetaWorld
                 print(f"    -- Processing dataset: '{dataset_name}'")
                 print(f"    -- Dataset config: {dataset_config}")
                 dataset_tasks = []
@@ -226,6 +228,11 @@ class LeRobotDataset(Dataset):
                         for task_obj in dataset_tasks
                         if "task_index" in task_obj and "task" in task_obj
                     }
+                    # 参考文件tasks.jsonl，得到的内容大致
+                    # task_index_to_task = {
+                    #     0: "Pick up a nut and place it onto a peg",
+                    #     1: "Push a mug under a coffee machine"
+                    # }                    
                     self.tasks[arm_name][dataset_name] = task_index_to_task
                 else:
                     raise FileNotFoundError(f"tasks file not found: {tasks_path}")
@@ -233,8 +240,9 @@ class LeRobotDataset(Dataset):
                 episodes_path = dataset_path / "meta" / "episodes.jsonl"
                 if episodes_path.exists():
                     self.episodes += pd.read_json(episodes_path, lines=True).to_dict("records")
-
-     
+                    # to_dict("records") 是进行了格式的转换
+                    # self.episodes 是一个列表，每一条记录都是 episode文件中的内容。
+    
                 stats_path = dataset_path / "meta" / "episodes_stats.jsonl"
                 stats_path_after_compute = dataset_path / "meta" / "stats.json"
                 if stats_path_after_compute.exists():
@@ -244,19 +252,20 @@ class LeRobotDataset(Dataset):
                     norm_arm_list.append(stats)
                 elif stats_path.exists():
                     stats = compute_lerobot_normalization_stats_from_minmax(stats_path)
-                   
+                
                     with open(stats_path_after_compute, "w") as f:
                         json.dump(stats, f, indent=4)
                
                     print(f"computed stats and saved to: {stats_path_after_compute}")
                     norm_arm_list.append(stats)
+                    ## norm_arm_list 列表中添加了机械臂的状态信息。
                 else:
                     raise FileNotFoundError(f"normalization stats file not found: {stats_path}")
             
 
             self.arm2stats_dict[arm_name] = merge_lerobot_stats(norm_arm_list)
 
-
+    # 这里装的是 state - action - timestamp
     def _load_trajectories(self):
 
         
@@ -473,13 +482,15 @@ class LeRobotDataset(Dataset):
         state_min = torch.tensor(norm_stats["observation.state"]["min"], dtype=torch.float32, device=device)
         state_max = torch.tensor(norm_stats["observation.state"]["max"], dtype=torch.float32, device=device)
         
-        state = 2 * (state - state_min) / (state_max - state_min + 1e-8) - 1
+        state = 2 * (state - state_min) / (state_max - state_min + 1e-8) - 1 ## 将所有的状态都norm到[-1 1]之间
         state = torch.clamp(state, -1.0, 1.0)  
 
         state_padded, state_mask = self._pad_tensor(
             state, self.max_state_dim
         )
-
+        # self.max_state_dim = 24
+        # 将state 补充到 24 维度，不足长度的补充0
+        # state_mask 记录了哪些是补充维度，哪些是真实维度，[True, True, False, ..., False]
 
         if item["action"] is None:
             raise ValueError("missing action, please check data integrity")

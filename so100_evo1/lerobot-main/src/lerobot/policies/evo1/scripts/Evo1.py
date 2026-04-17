@@ -102,7 +102,7 @@ class EVO1(nn.Module):
         else:
             return self.action_head(fused_tokens, state=state, actions_gt=actions_gt, action_mask=action_mask, embodiment_id=embodiment_ids)
 
-
+    ## 只有测试的时候会使用，训练不走
     @torch.no_grad()
     def run_inference(
         self,

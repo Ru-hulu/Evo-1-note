@@ -100,8 +100,12 @@ class InternVL3Embedder(nn.Module):
 
         if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
             self.model.vision_model.encoder.gradient_checkpointing = False
-        
-
+# 输入：2 张图片
+#     图 1：切成 4 块
+#     图 2：切成 9 块
+# 输出：
+#     pixel_values → shape = (13, 3, 448, 448)
+#     num_tiles_list → [4, 9]
     def _preprocess_images(
         self,
         image_tensors: List[Union[Image.Image, torch.Tensor]]
@@ -117,9 +121,15 @@ class InternVL3Embedder(nn.Module):
 
         pixel_values = torch.cat(pixel_values_list, dim=0).to(dtype=torch.bfloat16, device=self.device)
         num_tiles_list = [pv.shape[0] for pv in pixel_values_list]
-
         return pixel_values, num_tiles_list
-
+    # 根据每张图片被切了多少块（num_tiles_list），
+    # 自动生成对应数量的 <IMG_CONTEXT> 图片占位 token，
+    # 替换掉 prompt 里的 <image>，
+    # 最终生成模型能直接输入的多模态 prompt。
+    # 例如：
+    # Image-1: <img> + <IMG_CONTEXT> * (256*i) + </img> i是图像被切成了多少块
+    # Image-2: <img> + <IMG_CONTEXT> * (256*i) + </img> i是图像被切成了多少块 
+    # text_prompt （2张图片里有什么？）
     def _build_multimodal_prompt(
         self,
         num_tiles_list: List[int],
@@ -130,7 +140,9 @@ class InternVL3Embedder(nn.Module):
         for i in range(len(num_tiles_list)):
             prompt += f"Image-{i+1}: <image>\n"
         prompt += text_prompt.strip()
-
+        # Image-1: <image>
+        # Image-2: <image>
+        # 这张图片里有什么？
         IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
         IMG_START_TOKEN = "<img>"
         IMG_END_TOKEN = "</img>"
@@ -138,7 +150,9 @@ class InternVL3Embedder(nn.Module):
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         for tile_count in num_tiles_list:
             token_count = self.model.num_image_token * tile_count
+            # num_image_token只取决于 ViT 编码器的结构，不是我们可以调的参数，一般是256
             image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * token_count + IMG_END_TOKEN
+            # <img> + <IMG_CONTEXT> * (256*i) + </img> i 是图像被切成了多少块
             prompt = prompt.replace("<image>", image_tokens, 1)
 
         return prompt
@@ -163,26 +177,30 @@ class InternVL3Embedder(nn.Module):
             print("="*80 + "\n")
 
         model_inputs = self.tokenizer(prompt, return_tensors="pt", padding='max_length', truncation=True, max_length=self.max_text_length).to(self.device)
+        ## 这里将 prompt 转换为一长串的数字序列，就是对token的编码
         input_ids = model_inputs["input_ids"]
         attention_mask = model_inputs["attention_mask"]
 
        
         img_token_mask = (input_ids == self.img_context_token_id)
-     
+        # input_ids：整个 prompt 编码后的数字序列
+        # self.img_context_token_id：<IMG_CONTEXT> 对应的固定数字（比如 32100）
         img_token_locations = torch.where(img_token_mask)[1]
-
+        # 把所有 True 的 ** 位置索引（下标）** 提取出来
+        # 例如：[5,6,7,...,1028] 这一长串就是图片占位符的位置
 
         input_embeds = self.model.language_model.get_input_embeddings()(input_ids).clone()
-
+        # input_ids 是tocken的整数对应，将每个tocken转换为一个向量。
         B, N, C = input_embeds.shape
-        input_embeds = input_embeds.reshape(B * N, C)
-        input_ids = input_ids.reshape(B * N)
+        input_embeds = input_embeds.reshape(B * N, C) # tocken 对应的向量，C是向量的维度
+        input_ids = input_ids.reshape(B * N) # tocken 编码
 
         selected = (input_ids == self.img_context_token_id)
 
             
         try:
             input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
+            # 这里不要大语言模型对<IMG_CONTEXT>的编码，而是用vit先前对image tocken的编码替换
             ignore_flag = False
         except Exception as e:
             vit_embeds = vit_embeds.reshape(-1, C)
@@ -193,7 +211,7 @@ class InternVL3Embedder(nn.Module):
             ignore_flag = True
 
  
-        tokens_per_tile = self.model.num_image_token 
+        tokens_per_tile = self.model.num_image_token  # 一张image的小块被映射为多少tocken
  
         torch.set_printoptions(profile="full", threshold=float('inf'))
    
@@ -201,7 +219,7 @@ class InternVL3Embedder(nn.Module):
         current_token_idx = 0
         for i in range(len(image_mask)):
            
-            num_tiles_for_this_image = num_tiles_list[i]
+            num_tiles_for_this_image = num_tiles_list[i] ## 当前这张Image 被切成了几个块
             num_tokens_for_this_image = num_tiles_for_this_image * tokens_per_tile
        
             if not image_mask[i]:
@@ -229,7 +247,8 @@ class InternVL3Embedder(nn.Module):
         return_cls_only: bool = True,
     ):
 
-   
+        # pixel_values → shape = (13, 3, 448, 448)
+        # num_tiles_list → [4, 9]
         pixel_values, num_tiles_list = self._preprocess_images(image_tensors)
 
        
@@ -237,17 +256,18 @@ class InternVL3Embedder(nn.Module):
            
             print("Warning: No valid images to process after masking.")
 
-        vit_embeds = self.model.extract_feature(pixel_values)
-        fused_embeds = vit_embeds  
-        prompt = self._build_multimodal_prompt(num_tiles_list, text_prompt)
+        vit_embeds = self.model.extract_feature(pixel_values) # HuggingFace 模型 OpenGVLab/InternVL3-1B 的远程代码。
+        fused_embeds = vit_embeds # 图像被提取出来的特征信息，调了现有的模型
+        # 图像ViT提取出来的特征 (总块数×256, 块数就是前面切的，256就是_build_multimodal_prompt中的num_image_token)
+        prompt = self._build_multimodal_prompt(num_tiles_list, text_prompt) # 图像占位符 + 文字prompt
         inputs_embeds, attention_mask = self._prepare_and_fuse_embeddings(prompt, fused_embeds, image_mask, num_tiles_list)
-
+        # 文本 token + 图像 token → 拼在一起 → 变成 LLM 能看懂的输入 embedding
         outputs = self.model.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
-        )
+        ) # LLM进行推理
         fused_hidden = outputs.hidden_states[-1].to(torch.float32)
 
         return fused_hidden[:, 0, :] if return_cls_only else fused_hidden

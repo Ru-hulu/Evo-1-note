@@ -348,7 +348,7 @@ def train(config):
 
     # === Model ===
     model = EVO1(config)
-    model.train()
+    model.train() ##切换到训练模式。并不是类实现的函数
     model.set_finetune_flags()
 
     lr = get_with_warning(config, "lr", 1e-5)
@@ -433,7 +433,7 @@ def train(config):
             prompts = batch["prompts"]
             images_batch = batch["images"]
             image_masks = batch["image_masks"]
-            states = batch["states"].to(dtype=torch.bfloat16)
+            states = batch["states"].to(dtype=torch.bfloat16) # 这里关注一下，拿到的state长什么样子
             actions_gt = batch["actions"].to(dtype=torch.bfloat16)
             action_mask = batch["action_mask"]
             state_mask = batch["state_mask"]
@@ -443,11 +443,11 @@ def train(config):
             for prompt, images, image_mask in zip(prompts, images_batch, image_masks):
                 fused = model.get_vl_embeddings(images=images, image_mask=image_mask, prompt=prompt, return_cls_only=False)
                 fused_tokens_list.append(fused.to(dtype=torch.bfloat16))
-            
+                # inter 模型输出的结果，将image 和 text的token进行融合。
             fused_tokens = torch.cat(fused_tokens_list, dim=0)
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-
+                # 这里开始作前向传播了
                 pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask)
                 # 输入 语义信息，机器人的状态，真实动作
                 # 输出 随机noise 从noise状态下向target移动的 预测速度

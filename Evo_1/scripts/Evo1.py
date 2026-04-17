@@ -11,7 +11,7 @@ from model.action_head.flow_matching import FlowmatchingActionHead
 import logging
 class EVO1(nn.Module):
     def __init__(self, config: dict):
-        super().__init__() 
+        super().__init__()
         self.config = config
         self._device = config.get("device", "cuda")
         self.return_cls_only = config.get("return_cls_only", False)
@@ -56,7 +56,7 @@ class EVO1(nn.Module):
     def get_vl_embeddings(
         self,
         images: List[Image.Image],
-        image_mask: torch.Tensor,  
+        image_mask: torch.Tensor,
         prompt: str = "",
         return_cls_only: Union[bool, None] = None
     ) -> torch.Tensor:

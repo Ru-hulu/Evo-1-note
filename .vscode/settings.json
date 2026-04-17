@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "/media/hongrobot/jzao/evo1_envs/evo1-py310/bin/python",
+  "python.envFile": "${workspaceFolder}/.env"
+}
