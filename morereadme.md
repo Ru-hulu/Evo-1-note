@@ -84,19 +84,3 @@ state/action 的归一化与反归一化怎么做
 实际推理输入输出是什么格式
 run_inference() 在真实系统里怎么被调用
 尤其如果你关心机器人实际控制链路，这个文件很有价值。
-
-如果只给你一个“flow matching 之外最值得看 Top 3”，我会给这个顺序：
-
-Evo_1/scripts/Evo1.py (line 12)
-Evo_1/model/internvl3/internvl3_embedder.py (line 71)
-Evo_1/dataset/lerobot_dataset_pretrain_mp.py (line 145)
-因为这 3 个加上 flow_matching.py，基本就能把：
-
-输入从哪里来
-条件特征怎么形成
-动作怎么生成
-多 embodiment 怎么统一
-这一整套看完整。
-
-如果你愿意，我下一步可以直接给你出一版：
-“这个项目的核心阅读路线图”，按文件顺序告诉你每个文件应该先看哪些函数。

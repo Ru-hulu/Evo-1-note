@@ -433,7 +433,7 @@ def train(config):
             prompts = batch["prompts"]
             images_batch = batch["images"]
             image_masks = batch["image_masks"]
-            states = batch["states"].to(dtype=torch.bfloat16) # 这里关注一下，拿到的state长什么样子
+            states = batch["states"].to(dtype=torch.bfloat16)
             actions_gt = batch["actions"].to(dtype=torch.bfloat16)
             action_mask = batch["action_mask"]
             state_mask = batch["state_mask"]
@@ -450,9 +450,11 @@ def train(config):
                 # 这里开始作前向传播了
                 pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask)
                 # 输入 语义信息，机器人的状态，真实动作
-                # 输出 随机noise 从noise状态下向target移动的 预测速度
-            target_velocity = (actions_gt - noise).view(actions_gt.shape[0], -1)
-            
+                # 输出 从随机noise到actions_gt两者的中间状态   下向target移动的 预测速度
+                # 这里注意，虽然噪声 和 中间状态也是随机的(x_in = t*noise + (1-t)*action_gt) 每个随机噪声对应的t都是随机的
+                # 但是同一个噪声生成的所有 中间状态，对应的target_v都是一样的
+                # x_noise(随机生成的) ->x_in1(对应随机t1) ->x_in2(对应随机t2) -> ... ->x_in(tk) -> ...-> x_gt
+            target_velocity = (actions_gt - noise).view(actions_gt.shape[0], -1)    
             assert pred_velocity.shape == target_velocity.shape
 
             if action_mask.sum() == 0:
@@ -467,7 +469,7 @@ def train(config):
             loss = loss_fn(pred_velocity_mask, target_velocity) ## flow matching 模型损失计算的位置
             scale_factor = action_mask.numel() / (action_mask.sum() + 1e-8)
             loss = loss * scale_factor
-            
+
             # === NaN/Inf check ===
             if not check_numerical_stability(
                 step,

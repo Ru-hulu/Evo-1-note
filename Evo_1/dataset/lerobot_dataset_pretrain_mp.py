@@ -50,20 +50,44 @@ def compute_lerobot_normalization_stats_from_minmax(jsonl_path):
     }
 
 def merge_lerobot_stats(stats_list: List[Dict[str, Dict[str, List[float]]]]) -> Dict:
-    state_mins = [np.array(d["observation.state"]["min"]) for d in stats_list]
+    state_mins = [np.array(d["observation.state"]["min"]) for d in stats_list] 
+    # 每个数据集的 state逐维最小值
+    # [[x x x x x x],
+    # ...
+    # [x x x x x x]]
     state_maxs = [np.array(d["observation.state"]["max"]) for d in stats_list]
     action_mins = [np.array(d["action"]["min"]) for d in stats_list]
     action_maxs = [np.array(d["action"]["max"]) for d in stats_list]
     state_min_global = np.min(np.stack(state_mins), axis=0).tolist()
     state_max_global = np.max(np.stack(state_maxs), axis=0).tolist()
     action_min_global = np.min(np.stack(action_mins), axis=0).tolist()
-    action_max_global = np.max(np.stack(action_maxs), axis=0).tolist()
-
+    # [[x x x x x x]]
+    action_max_global = np.max(np.stack(action_maxs), axis=0).tolist() # 全数据集的 state 逐维最小值
     return {
         "observation.state": {"min": state_min_global, "max": state_max_global},
         "action": {"min": action_min_global, "max": action_max_global}
     }
 
+# 对于一个完整的文件(任务)
+# 源文件: /media/hongrobot/jzao/evo1_datasets/Evo1_MetaWorld_Dataset/data/chunk-000/episode_000000.parquet
+# 将他拆分为若个文件，每个文件包含H个时间戳的episode_000000.parquet数据，例如
+# 0_50.pkl
+# 1_51.pkl
+# 2_52.pkl
+# 每个文件内容 例如2(t1)_52(t2).pkl
+# episode = {
+#     "arm_key": arm_name,
+#     "dataset_key": dataset_name,
+#     "prompt": prompt, # episode_000000.parquet对应的 prompt
+#     "state":  这个片段中的第一个状态，即 2 时间戳的状态
+#     "action": 这个片段中所有的action， 即 2-52 时间戳对应的action
+#     "video_paths": episode_000000.parquet对应的视频文件，若多视角采集，是一个字符串数组，video_paths[view_key]=path
+#     "timestamp": 这个片段中第一帧时间辍, 如果步长0.03, 则为0.06（因为2 * 0.03）
+# }
+# 返回的 episode_files = 是文件列表，每个类似
+# /home/dell/code/lintao/Evo_1/training_data_cache/metaworld_sawyer/Evo1_MetaWorld/chunk-000/episode_000000/0_50.pkl
+# /home/dell/code/lintao/Evo_1/training_data_cache/metaworld_sawyer/Evo1_MetaWorld/chunk-000/episode_000000/1_51.pkl
+# /home/dell/code/lintao/Evo_1/training_data_cache/metaworld_sawyer/Evo1_MetaWorld/chunk-000/episode_000000/2_52.pkl
 
 def _process_parquet_file_worker(args):
     parquet_path, arm_name, dataset_name, dataset_config, dataset_path, task_mapping, action_horizon, max_samples_per_file, cache_dir = args
@@ -80,10 +104,10 @@ def _process_parquet_file_worker(args):
         last_row = df.iloc[-1:]  
         padding_rows = pd.concat([last_row] * action_horizon, ignore_index=True)
         df = pd.concat([df, padding_rows], ignore_index=True)
-
+        ## 文件的最后一行多复制几次
         if max_samples_per_file is not None:
             df = df.head(max_samples_per_file)
-
+        # 如果对文件长度有限制，则文件截断
         episode_files = []
         for i in range(len(df) - action_horizon + 1): 
             start_idx = i
@@ -97,10 +121,14 @@ def _process_parquet_file_worker(args):
             
             if cache_filepath.exists():
                 episode_files.append(str(cache_filepath))
+                # episode_files 中添加的
+                # 0_50.pkl
+                # 1_51.pkl
+                # 2_52.pkl
                 continue
             
             logging.info(f"build {cache_filename}")
-            sub_df = df.iloc[i: i + action_horizon]
+            sub_df = df.iloc[i: i + action_horizon] ## 某个文件 长度为action_horizon 的片段
             video_paths = {}
             base_video_path = dataset_path / "videos" / parquet_path.parent.name
 
@@ -115,7 +143,12 @@ def _process_parquet_file_worker(args):
             
             task_index = sub_df.iloc[0].get("task_index", None)
             if task_index is not None and task_index in task_mapping:
-                prompt = task_mapping[task_index]
+                prompt = task_mapping[task_index] # 拿到提示词
+                # task_mapping长这样
+                # {
+                #     0: "Pick up a nut and place it onto a peg",
+                #     1: "Push a mug under a coffee machine"
+                # }
             else:
                 logging.info(f"cannot find task description from task_index={task_index}")
                 prompt = ""
@@ -123,11 +156,11 @@ def _process_parquet_file_worker(args):
             episode = {
                 "arm_key": arm_name,
                 "dataset_key": dataset_name,
-                "prompt": prompt,
-                "state": sub_df.iloc[0].get("observation.state", None),
-                "action": [row["action"] for _, row in sub_df.iterrows()],
+                "prompt": prompt, # 这里拿到了这个整个文件对应的 prompt
+                "state": sub_df.iloc[0].get("observation.state", None), # 这里拿到了这个片段中的第一个状态
+                "action": [row["action"] for _, row in sub_df.iterrows()], # 这里拿到了这个片段中所有的action
                 "video_paths": video_paths,
-                "timestamp": sub_df.iloc[0].get("timestamp", None),
+                "timestamp": sub_df.iloc[0].get("timestamp", None), # 这里拿到了这个片段中的第一帧时间辍
             }
             
             cache_subdir.mkdir(parents=True, exist_ok=True)
@@ -187,12 +220,12 @@ class LeRobotDataset(Dataset):
 
         self._load_metadata()
         self._load_trajectories()
-
+        # 定义了对图像预处理的变化
         self.basic_transform = T.Compose([
             T.Resize((448, 448), interpolation=InterpolationMode.BICUBIC),
             T.ToTensor()
         ])
-
+        # 定义了对图像预处理的变化
         self.aug_transform = T.Compose([
             T.RandomResizedCrop(448, scale=(0.95, 1.0), interpolation=InterpolationMode.BICUBIC),
             T.RandomRotation(degrees=(-5, 5), interpolation=InterpolationMode.BICUBIC), 
@@ -200,16 +233,49 @@ class LeRobotDataset(Dataset):
             T.ToTensor()
         ])
 
+    # _load_metadata函数执行后
+    # self.tasks[arm_name][dataset_name] 的内容
+    # task_index_to_task = {
+    #     0: "Pick up a nut and place it onto a peg",
+    #     1: "Push a mug under a coffee machine"
+    # }  其中 arm_name: "metaworld_sawyer" dataset_name: "Evo1_MetaWorld" 是固定值
+    # self.episodes = [
+    #     {
+    #         "episode_index": 0,
+    #         "tasks": ["Pick up a nut and place it onto a peg"],
+    #         "length": 97
+    #     },
+    #     ... 会有连续多个episode 的 prompt 字符串是一样的。
+    #     {
+    #         "episode_index": 49,
+    #         "tasks": ["Pick up a nut and place it onto a peg"],
+    #         "length": 98
+    #     },
+    #     {
+    #         "episode_index": 50,
+    #         "tasks": ["Push a mug under a coffee machine"],
+    #         "length": 50
+    #     },
+    #     ...
+    #     {
+    #         "episode_index": 59,
+    #         "tasks": ["Push a mug under a coffee machine"],
+    #         "length": 50
+    #     }
+    # ]
+    # self.arm2stats_dict[arm_name] 
+    # {
+    #     "observation.state": {"min": state_min_global, "max": state_max_global},
+    #     "action": {"min": action_min_global, "max": action_max_global}
+    # }   
+    # 记录的是所有episode的 state 逐维的 最大最小信息
+    # 记录的是所有episode的 action 逐维的 最大最小信息
     def _load_metadata(self):
-
         self.episodes = []
         self.tasks = {}
         norm_stats_list = []
-
-        # for arms
         for arm_name, arm_config in self.config['data_groups'].items():
             print(f"  -- Processing arm group: '{arm_name}'")
-
             norm_arm_list = []
             self.tasks[arm_name] = {}
             for dataset_name, dataset_config in arm_config.items():
@@ -240,9 +306,12 @@ class LeRobotDataset(Dataset):
                 episodes_path = dataset_path / "meta" / "episodes.jsonl"
                 if episodes_path.exists():
                     self.episodes += pd.read_json(episodes_path, lines=True).to_dict("records")
-                    # to_dict("records") 是进行了格式的转换
-                    # self.episodes 是一个列表，每一条记录都是 episode文件中的内容。
-    
+                    # {"episode_index": 0, "tasks": ["Pick up a nut and place it onto a peg"], "length": 97}
+                    # ...
+                    # {"episode_index": 49, "tasks": ["Pick up a nut and place it onto a peg"], "length": 98}
+                    # {"episode_index": 50, "tasks": ["Push a mug under a coffee machine"], "length": 50}
+                    # ...
+                    # {"episode_index": 59, "tasks": ["Push a mug under a coffee machine"], "length": 50}
                 stats_path = dataset_path / "meta" / "episodes_stats.jsonl"
                 stats_path_after_compute = dataset_path / "meta" / "stats.json"
                 if stats_path_after_compute.exists():
@@ -255,35 +324,45 @@ class LeRobotDataset(Dataset):
                 
                     with open(stats_path_after_compute, "w") as f:
                         json.dump(stats, f, indent=4)
-               
+                
                     print(f"computed stats and saved to: {stats_path_after_compute}")
                     norm_arm_list.append(stats)
-                    ## norm_arm_list 列表中添加了机械臂的状态信息。
+                    # {
+                    #     "observation.state": {"min": state_min_global, "max": state_max_global},
+                    #     "action": {"min": action_min_global, "max": action_max_global}
+                    # }   
+                    # 记录的是所有episode的 state 逐维的 最大最小信息
+                    # 记录的是所有episode的 action 逐维的 最大最小信息
                 else:
                     raise FileNotFoundError(f"normalization stats file not found: {stats_path}")
-            
-
             self.arm2stats_dict[arm_name] = merge_lerobot_stats(norm_arm_list)
 
-    # 这里装的是 state - action - timestamp
+
+    # 执行后 self.data 更新为文件列表，形如
+    # /home/dell/code/lintao/Evo_1/training_data_cache/metaworld_sawyer/Evo1_MetaWorld/chunk-000/episode_000000/0_50.pkl
+    # /home/dell/code/lintao/Evo_1/training_data_cache/metaworld_sawyer/Evo1_MetaWorld/chunk-000/episode_000000/1_51.pkl
+    # /home/dell/code/lintao/Evo_1/training_data_cache/metaworld_sawyer/Evo1_MetaWorld/chunk-000/episode_000000/2_52.pkl
     def _load_trajectories(self):
-
-        
-
         parquet_process_units = []
         for arm_name, arm_config in self.config['data_groups'].items():
             for dataset_name, dataset_config in arm_config.items():
+                # 外层 arm_name: metaworld_sawyer
+                # 内层 dataset_name: Evo1_MetaWorld
                 dataset_path = dataset_config.get('path', None)
                 if dataset_path is None:
                     raise ValueError(f"Dataset path for '{arm_name}-{dataset_name}' is not configured, please check the config")
                 dataset_path = Path(dataset_path)
                 parquet_files = list(dataset_path.glob("data/*/*.parquet"))
-                
+                # 拿到所有的 *.parquet文件
                 task_mapping = self.tasks[arm_name][dataset_name]
-                
+                # task_mapping长这样
+                # {
+                #     0: "Pick up a nut and place it onto a peg",
+                #     1: "Push a mug under a coffee machine"
+                # }
                 for parquet_path in parquet_files:
                     parquet_process_units.append((
-                        parquet_path, 
+                        parquet_path,  # 例如 /media/hongrobot/jzao/evo1_datasets/Evo1_MetaWorld_Dataset/data/chunk-000/xxx.parquet
                         arm_name, 
                         dataset_name, 
                         dataset_config, 
@@ -293,17 +372,10 @@ class LeRobotDataset(Dataset):
                         self.max_samples_per_file,
                         self.cache_dir  
                     ))
-
-       
         print(f"total {len(parquet_process_units)} parquet files to process")
-        
-   
-        num_processes = min(16, len(parquet_process_units))
-
+        num_processes = min(16, len(parquet_process_units)) # 有多少个文件，最大有16个文件
         print(f"Using {num_processes} processes for concurrent processing")
-        
- 
-        with mp.Pool(processes=num_processes) as pool:
+        with mp.Pool(processes=num_processes) as pool: # 创建进程池，每个进程执行 _process_parquet_file_worker
             
             total_episodes = 0
             with tqdm(total=len(parquet_process_units), desc="Processing Parquet files to cache") as pbar:
@@ -311,8 +383,8 @@ class LeRobotDataset(Dataset):
                     if error:
                         logging.error(error)
                     else:
-                        self.data.extend(episode_files)  
-                        total_episodes += len(episode_files)
+                        self.data.extend(episode_files) ## 将所有的.parquet拆分为片段文件。
+                        total_episodes += len(episode_files) ## 一共有多少个片段文件
                     
                     pbar.set_postfix({
                         'episodes_this_file': len(episode_files),
@@ -353,10 +425,8 @@ class LeRobotDataset(Dataset):
         for view, path in video_paths.items():
             if not os.path.exists(path):
                 raise FileNotFoundError(f"video file not found: {path}")
-            
             if self.video_backend == "decord":
                 import decord
-
                 try:
                     ctx = self.video_backend_kwargs.get("ctx", "cpu")
                     if ctx == "cpu":
@@ -407,20 +477,27 @@ class LeRobotDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
-
+    # 函数处理了一个 pkl 文件(一次实验的某个片段)
+    #{
+    #     "images": images, 这次实验的所有视图的视频，在这个pkl对应时间戳的图片
+    #     "image_mask": image_mask, 由于视图可能比预设值小，需要用空图片补，有类似[1 0 0]的mask，0代表用了空图片
+    #     "prompt": prompt, 任务对应的提示词
+    #     "state": state_padded.to(dtype=torch.bfloat16), pkl 第一帧的状态信息norm后的结果
+    #     "state_mask": state_mask, 如果状态信息的维度低于预设值，则需要用0补，[3.2,2.1,2.3,4.5,0,...,0] 类似
+    #     "action": action_padded.to(dtype=torch.bfloat16), pkl中所有动作信息(包含H个步长)norm后的结果，
+    #     "action_mask": action_mask, # 一样做了维度补齐，所以有mask
+    #     "embodiment_id": torch.tensor(embodiment_id, dtype=torch.long)
+    # }
     def __getitem__(self, idx):
 
         cache_filepath = self.data[idx]
         
         try:
-            with open(cache_filepath, 'rb') as f:
+            with open(cache_filepath, 'rb') as f: # 这里是打开了某一个pkl文件
                 item = pickle.load(f)
         except Exception as e:
             logging.info(f"cannot load cache file {cache_filepath}: {str(e)}")
-            
             return self[random.randint(0, len(self.data)-1)]
- 
-        
         arm_key = item["arm_key"]
         dataset_key = item["dataset_key"]
         embodiment_id = self.arm_to_embodiment_id[arm_key]
@@ -428,14 +505,14 @@ class LeRobotDataset(Dataset):
  
         try:
             frames = self._load_video_frame(item["video_paths"], item["timestamp"])
+            # pkl文件 中 有 视频文件列表。
+            # 每个视频文件都读取时间戳为timestamp的图像
         except Exception as e:
       
             logging.info(f"skipping sample that cannot decode video {self.data[idx]}: {e}")
             return self[random.randint(0, len(self.data)-1)]  
 
         images = frames
-
-
         if self.use_augmentation:
            
             images = [
@@ -443,39 +520,28 @@ class LeRobotDataset(Dataset):
                 for img in images
             ]
         else:
-         
             images = [self.basic_transform(img) for img in images]
 
- 
         num_real_views = len(images)
         image_mask = torch.zeros(self.max_views, dtype=torch.bool)
         image_mask[:num_real_views] = True 
-
-
+        # 如果这一时间戳对应的image数量比设定少，就通过补空图片的方式来填补
         while len(images) < self.max_views:
-           
             if len(images) == 0:
                 dummy_image = torch.zeros(3, 448, 448)
                 logging.info("Warning: Image list is empty, using zero tensor for padding")
             else:
                 dummy_image = torch.zeros_like(images[0]) 
             images.append(dummy_image)
-
         images = torch.stack(images)
-
+        # k张[3, 448, 448] -> [k, 3, 448, 448]
 
         if item["state"] is None:
             raise ValueError("missing observation.state, please check data integrity")
-        
-    
-
         try:
             norm_stats = self.arm2stats_dict[arm_key]
         except KeyError:
-        
             raise KeyError(f"Normalization stats not found for arm_key={arm_key} and dataset_key={dataset_key}")
-
-        
 
         state = torch.tensor(item["state"], dtype=torch.float32)
         device = state.device

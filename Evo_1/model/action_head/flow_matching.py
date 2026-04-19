@@ -9,9 +9,10 @@ class SinusoidalPositionalEncoding(nn.Module): ## 给动作序列的时间步位
         super().__init__()
         pe = torch.zeros(max_len, dim) # 1. 创建一个全 0 的位置编码矩阵，形状 [max_len, dim]
         position = torch.arange(0, max_len).unsqueeze(1) # 2. 生成位置索引：0,1,2,...,999 [max_len] -> 形状变成 [max_len, 1]
-        div_term = torch.exp(torch.arange(0, dim, 2) * -(math.log(10000.0) / dim)) # \frac{1}   {10000^{\frac{2i}{d_{model}}}}
+        div_term = torch.exp(torch.arange(0, dim, 2) * -(math.log(10000.0) / dim)) # 1/10000^{2i/dim} 形状[dim/2]
         pe[:, 0::2] = torch.sin(position * div_term) ## 2i的位置编码
         pe[:, 1::2] = torch.cos(position * div_term) ## 2i+1的位置编码
+        # pe的第i行内容为 sin(ai) cos(ai) ... sin(ai) cos(ai),其中ai仅与i相关
         pe = pe.unsqueeze(0)  ## [max_len, dim]->[1, max_len, dim]
         self.register_buffer('pe', pe)
 
@@ -231,6 +232,17 @@ class FlowmatchingActionHead(nn.Module):
                                                                num_categories=num_categories)
 
     # 前向传播（训练用）
+    ## noise 是随即生成的噪声位置
+    ## pre_velocity 是 noise 和 target之间若干个随机位置，预测的速度向量。
+    ## 假设当前state 对应的帧是t
+    # fused_tokens: prompt + t时刻的多视角image融合
+    # actions_gt: t 时刻开始的 H 时刻内的所有  action， 列为 action_dim, 行为H
+    # state_emb: t 时刻的 状态编码
+    # 随机变量 noise：actions_gt 同维度随机噪声
+    # actions_m: 随机权重 (1-r)noise + r*actions_gt 加权
+    # 映射: actions_m, state_emb, fused_tokens -> target_v(actions_gt - noise)
+    # 可以理解为给定 fused_tokens 和 state_emb 的条件下，时变向量场action的建模:对任意给定的一个点action_t,都可以映射出一个对应的速度
+    # v_theta(action_t, t | fused_tokens, state)
     def forward(self, fused_tokens: torch.Tensor, state: torch.Tensor = None,
                 actions_gt: torch.Tensor = None, embodiment_id: torch.LongTensor = None, 
                 state_mask: torch.Tensor = None, action_mask: torch.Tensor = None):
@@ -251,15 +263,15 @@ class FlowmatchingActionHead(nn.Module):
 
         t = torch.distributions.Beta(2, 2).sample((B,)).clamp(0.02, 0.98).to(device).to(dtype=self.dtype)
         # 维度是[B],每个数都在[0.02,0.98]之间
+        # t = [t1, .... , tB]
         time_index = (t * 1000).long() # 得到的是[B],但是数值在[2,980]之间，可以理解为B个索引值
         time_emb = self.time_pos_enc(1000)[:, time_index, :].squeeze(0) ## 时间在这里
-        # [1,1000,embed_dim] ->依据索引选->[1,B,embed_dim]->[B,embed_dim]
-        action_shape = actions_gt.shape[1]  
+        # 为 0~999 这 1000 个离散时间步，分别生成一个 embed_dim 维的时间向量[1,1000,embed_dim] 
+        # ->依据索引选->[1,B,embed_dim]->[B,embed_dim] 筛选出了这B个时间步的对应时间向量
+        action_shape = actions_gt.shape[1]  # B H D
         actions_gt_seq = actions_gt # 真实动作（标签）
-
-
         noise = torch.rand_like(actions_gt) * 2 - 1 #actions_gt 形状完全一样的张量，每个值[-1,1]，
-
+        # B H D
         if action_mask is not None:
             action_mask = action_mask.to(dtype=noise.dtype, device=noise.device) # type 是统一数据类型，例如float32
             assert action_mask.shape == noise.shape, f"action_mask shape {action_mask.shape} != noise shape {noise.shape}"
@@ -267,50 +279,45 @@ class FlowmatchingActionHead(nn.Module):
 
         if self.horizon > 1:
             noise_seq = noise.view(B, self.horizon, self.per_action_dim)
-            
+            t_broadcast = t.view(B, 1, 1) ## 随机时间
         else:
             noise_seq = noise.unsqueeze(1)
-
-        if self.horizon > 1:
-            t_broadcast = t.view(B, 1, 1) ## 时间在这里
-        else:
             t_broadcast = t.view(B, 1)
+
         action_intermediate_seq = (1 - t_broadcast) * noise_seq + t_broadcast * actions_gt_seq  
         # 对噪声和真实动作进行加权，得到加噪的噪声 
         # [B,1,1] * [B, self.horizon, self.per_action_dim] + [B,1,1] * [B, self.horizon, self.per_action_dim]
         # 采样一条从噪声到真实动作的路径上的中间点。
-        if self.horizon > 1 and self.action_encoder is not None:
-
+        #      |noise_seq1|    |actions_gt_seq1|   |action_intermediate_seq1|
+        # (1-t)|noise_seq2| + t|actions_gt_seq2| = |action_intermediate_seq2|
+        # t 属于 (0.02,0.98)  noise_seq1 随机产生
+        if self.horizon > 1 and self.action_encoder is not None: 
             action_tokens = self.action_encoder(action_intermediate_seq, embodiment_id)  
         else:
-
             if not hasattr(self, "single_action_proj"):
                 self.single_action_proj = nn.Linear(self.per_action_dim, self.embed_dim).to(device)
             action_tokens = self.single_action_proj(action_intermediate_seq) 
-
-        x = action_tokens  
+        # action_intermediate_seq 为 B H D
+        # action_tokens  为 B H D1，每一行对应的t 都不一样， time_emb 为  B H time_emb, 每一行都是对这个t整数化后计算得到的时间向量
+        x = action_tokens
         for block in self.transformer_blocks:
             x = block(x, context_tokens, time_emb) ## 中间态 真实态对应的上下文信息 中间态对应的时间点
 
         x = self.norm_out(x)  
 
         if self.horizon > 1:
- 
             x_flat = x.reshape(B, -1)  
-
             if not hasattr(self, "seq_pool_proj"):
-              
                 self.seq_pool_proj = nn.Linear(self.horizon * self.embed_dim, self.embed_dim).to(device)
             x_pooled = self.seq_pool_proj(x_flat)  
-        else:
-          
+        else:          
             x_pooled = x.squeeze(1) 
-
         pred_velocity = self.mlp_head(x_pooled, embodiment_id) ## 预测速度
-
         return pred_velocity, noise
-        ## noise 是随即生成的噪声位置
-        ## pre_velocity 是 noise 和 target之间若干个位置，预测的速度向量。
+        # noise 是起点
+        # actions_gt 是终点
+        # action_intermediate_seq 是路上的某个位置
+        # pred_velocity 是在这个位置应该走的方向和速度
     # 动作生成 (部署用)
     def get_action(self, fused_tokens: torch.Tensor, state: torch.Tensor = None, embodiment_id: torch.LongTensor = None, action_mask: torch.Tensor = None):
 
@@ -373,14 +380,12 @@ class FlowmatchingActionHead(nn.Module):
 
 
             if self.horizon > 1 and self.action_encoder is not None:
-
                 action_seq = action_seq * action_mask
                 action_tokens = self.action_encoder(action_seq, embodiment_id) 
             else:
                 if hasattr(self, "single_action_proj"):
                     action_tokens = self.single_action_proj(action_seq)  
                 else:
-
                     self.single_action_proj = nn.Linear(per_action_dim, self.embed_dim).to(device)
                     action_tokens = self.single_action_proj(action_seq)
 
@@ -394,7 +399,6 @@ class FlowmatchingActionHead(nn.Module):
                 if hasattr(self, "seq_pool_proj"):
                     x_pooled = self.seq_pool_proj(x_flat)
                 else:
-                   
                     self.seq_pool_proj = nn.Linear(self.horizon * self.embed_dim, self.embed_dim).to(device)
                     x_pooled = self.seq_pool_proj(x_flat)
             else:
@@ -421,3 +425,7 @@ class FlowmatchingActionHead(nn.Module):
         
         return next(self.parameters()).dtype
 
+
+
+
+# 遗留问题：flow matching 在训练和测试的时候，对时间编码分别是如何利用的？

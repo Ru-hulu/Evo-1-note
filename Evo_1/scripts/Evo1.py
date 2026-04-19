@@ -97,9 +97,9 @@ class EVO1(nn.Module):
         embodiment_ids: torch.Tensor = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         
-        if actions_gt is None:
+        if actions_gt is None: # 测试模式
             return self.action_head.get_action(fused_tokens, state=state, action_mask=action_mask, embodiment_id=embodiment_ids)
-        else:
+        else: # 训练模式 actions_gt 用来加噪声
             return self.action_head(fused_tokens, state=state, actions_gt=actions_gt, action_mask=action_mask, embodiment_id=embodiment_ids)
 
 
@@ -148,3 +148,20 @@ class EVO1(nn.Module):
             self._freeze_module(self.action_head, "Action Head")
         else:
             print("Finetuning Action Head...")
+
+
+# Stage 1:
+# 命令参数：--finetune_action_head
+# VLM：冻结
+# Action Head：训练
+# checkpoint：保存 stage1 权重
+
+# Stage 2:
+# 命令参数：--finetune_vlm --finetune_action_head --resume --resume_pretrain
+# 初始化：加载 stage1 权重
+# VLM：训练
+# Action Head：训练
+# optimizer/scheduler：重新开始
+
+# 论文里的两阶段训练，在代码中主要不是通过 stage 分支实现，
+# 而是通过 finetune_vlm / finetune_action_head / resume_pretrain 这几个命令行参数控制。
