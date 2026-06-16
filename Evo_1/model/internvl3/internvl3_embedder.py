@@ -104,8 +104,12 @@ class InternVL3Embedder(nn.Module):
 #     图 1：切成 4 块
 #     图 2：切成 9 块
 # 输出：
-#     pixel_values → shape = (13, 3, 448, 448)
+#     pixel_values → shape = (9 + 4, 3, 448, 448)
 #     num_tiles_list → [4, 9]
+# 当前默认配置下，输入 [3, 3, 448, 448]
+# 每张图片被切成一块（没有切） 
+# num_tiles_list[1, 1, 1]
+# pixel_values[3, 3, 448, 448]
     def _preprocess_images(
         self,
         image_tensors: List[Union[Image.Image, torch.Tensor]]
@@ -129,6 +133,7 @@ class InternVL3Embedder(nn.Module):
     # 例如：
     # Image-1: <img> + <IMG_CONTEXT> * (256*i) + </img> i是图像被切成了多少块
     # Image-2: <img> + <IMG_CONTEXT> * (256*i) + </img> i是图像被切成了多少块 
+    # Image-3: <img> + <IMG_CONTEXT> * (256*i) + </img> i是图像被切成了多少块 
     # text_prompt （2张图片里有什么？）
     def _build_multimodal_prompt(
         self,
@@ -142,7 +147,7 @@ class InternVL3Embedder(nn.Module):
         prompt += text_prompt.strip()
         # Image-1: <image>
         # Image-2: <image>
-        # 这张图片里有什么？
+        # 2张图片里有什么？
         IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
         IMG_START_TOKEN = "<img>"
         IMG_END_TOKEN = "</img>"
@@ -152,11 +157,17 @@ class InternVL3Embedder(nn.Module):
             token_count = self.model.num_image_token * tile_count
             # num_image_token只取决于 ViT 编码器的结构，不是我们可以调的参数，一般是256
             image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * token_count + IMG_END_TOKEN
-            # <img> + <IMG_CONTEXT> * (256*i) + </img> i 是图像被切成了多少块
+            # <img> + <IMG_CONTEXT> * (256*1) + </img> 
             prompt = prompt.replace("<image>", image_tokens, 1)
-
         return prompt
+            # prompt 在循环结束后变成
+            # <img> + <IMG_CONTEXT> * (256*1) + </img> 
+            # <img> + <IMG_CONTEXT> * (256*1) + </img> 
+            # 2张图片里有什么？
     
+    # 将prompt 转换为token向量。维度[1，1024, 896]，就是1024个token，每个维度896
+    # 以及维度为[1, 1024]的mask，标记哪些token 是有效的
+    # 注意，这里已经在处理一条数据，而不是一个batch 的数据了
     def _prepare_and_fuse_embeddings(
         self,
         prompt: str,
@@ -166,7 +177,9 @@ class InternVL3Embedder(nn.Module):
     ) -> (torch.Tensor, torch.Tensor):
    
         untruncated_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+        # 这里用tokenizer处理prompt，然后获得维度
         true_sequence_length = untruncated_ids.shape[1]
+        # 一共有多少token
 
         if true_sequence_length > self.max_text_length:
             print("\n" + "="*80)
@@ -177,20 +190,21 @@ class InternVL3Embedder(nn.Module):
             print("="*80 + "\n")
 
         model_inputs = self.tokenizer(prompt, return_tensors="pt", padding='max_length', truncation=True, max_length=self.max_text_length).to(self.device)
-        ## 这里将 prompt 转换为一长串的数字序列，就是对token的编码
         input_ids = model_inputs["input_ids"]
+        # 这里用tokenizer处理prompt，然后获得 token_id
         attention_mask = model_inputs["attention_mask"]
-
-       
+        # 大概长这样，0表示当前token 不需要模型关注。[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]
+        # 和 attention matrix 不是一个概念。
         img_token_mask = (input_ids == self.img_context_token_id)
         # input_ids：整个 prompt 编码后的数字序列
         # self.img_context_token_id：<IMG_CONTEXT> 对应的固定数字（比如 32100）
         img_token_locations = torch.where(img_token_mask)[1]
-        # 把所有 True 的 ** 位置索引（下标）** 提取出来
+        # 把input_ids 中对应<IMG_CONTEXT>的 索引 提取出来
         # 例如：[5,6,7,...,1028] 这一长串就是图片占位符的位置
 
         input_embeds = self.model.language_model.get_input_embeddings()(input_ids).clone()
-        # input_ids 是tocken的整数对应，将每个tocken转换为一个向量。
+        # input_ids 是tocken的整数对应，找到每个id对应的token向量。
+        # [1, 1024, 896] 注意，这我们已经是处理一个batch 中的一条数据了，所以B = 1，有1024个token ，维度是896
         B, N, C = input_embeds.shape
         input_embeds = input_embeds.reshape(B * N, C) # tocken 对应的向量，C是向量的维度
         input_ids = input_ids.reshape(B * N) # tocken 编码
@@ -211,7 +225,7 @@ class InternVL3Embedder(nn.Module):
             ignore_flag = True
 
  
-        tokens_per_tile = self.model.num_image_token  # 一张image的小块被映射为多少tocken
+        tokens_per_tile = self.model.num_image_token  # 一张image的小块被映射为多少tocken，配置下为16*16 = 256
  
         torch.set_printoptions(profile="full", threshold=float('inf'))
    
@@ -219,16 +233,14 @@ class InternVL3Embedder(nn.Module):
         current_token_idx = 0
         for i in range(len(image_mask)):
            
-            num_tiles_for_this_image = num_tiles_list[i] ## 当前这张Image 被切成了几个块
-            num_tokens_for_this_image = num_tiles_for_this_image * tokens_per_tile
+            num_tiles_for_this_image = num_tiles_list[i] ## 当前这张Image 被切成了几个块，但是当前配置下是1.
+            num_tokens_for_this_image = num_tiles_for_this_image * tokens_per_tile # 256
        
             if not image_mask[i]:
-                
                 start_idx = img_token_locations[current_token_idx]
                 end_idx = start_idx + num_tokens_for_this_image
-               
                 attention_mask[0, start_idx:end_idx] = 0
-    
+            ## 如果当前图像是无效的，则把它对应的token 位置打上mask
             current_token_idx += num_tokens_for_this_image
 
         input_embeds = input_embeds.reshape(B, N, C)
@@ -241,7 +253,7 @@ class InternVL3Embedder(nn.Module):
 
     def get_fused_image_text_embedding_from_tensor_images(
         self,
-        image_tensors: list[Union[Image.Image, torch.Tensor]],
+        image_tensors: list[Union[Image.Image, torch.Tensor]], #[3, 3, 448, 448]
         image_mask: torch.Tensor,
         text_prompt: str,
         return_cls_only: bool = True,
@@ -256,8 +268,13 @@ class InternVL3Embedder(nn.Module):
            
             print("Warning: No valid images to process after masking.")
 
-        vit_embeds = self.model.extract_feature(pixel_values) # HuggingFace 模型 OpenGVLab/InternVL3-1B 的远程代码。
-        fused_embeds = vit_embeds # 图像被提取出来的特征信息，调了现有的模型
+        vit_embeds = self.model.extract_feature(pixel_values) 
+        # 图像先过 Intern ViT 300M
+        # vit_embeds.shape = [3, 256, 896]
+        # 3   = 输入的 3 张图
+        # 256 = 每张图变成 256 个视觉 token
+        # 896 = 每个视觉 token 的 embedding 维度
+        fused_embeds = vit_embeds # 图像被提取出来的特征信息
         # 图像ViT提取出来的特征 (总块数×256, 块数就是前面切的，256就是_build_multimodal_prompt中的num_image_token)
         prompt = self._build_multimodal_prompt(num_tiles_list, text_prompt) # 图像占位符 + 文字prompt
         inputs_embeds, attention_mask = self._prepare_and_fuse_embeddings(prompt, fused_embeds, image_mask, num_tiles_list)
@@ -267,7 +284,7 @@ class InternVL3Embedder(nn.Module):
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
-        ) # LLM进行推理
+        ) # LLM进行推理，就是过Qwen2.5 0.5B
         fused_hidden = outputs.hidden_states[-1].to(torch.float32)
 
         return fused_hidden[:, 0, :] if return_cls_only else fused_hidden

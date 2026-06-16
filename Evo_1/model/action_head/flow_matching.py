@@ -235,8 +235,9 @@ class FlowmatchingActionHead(nn.Module):
     ## noise 是随即生成的噪声位置
     ## pre_velocity 是 noise 和 target之间若干个随机位置，预测的速度向量。
     ## 假设当前state 对应的帧是t
-    # fused_tokens: prompt + t时刻的多视角image融合
-    # actions_gt: t 时刻开始的 H 时刻内的所有  action， 列为 action_dim, 行为H
+    # fused_tokens: prompt + t时刻的多视角image融合 [8, 1024, 896]
+    # states.shape = [8, 24]
+    # actions_gt: t 时刻开始的 H 时刻内的所有  action， 列为 action_dim, 行为H [8, 50, 24]
     # state_emb: t 时刻的 状态编码
     # 随机变量 noise：actions_gt 同维度随机噪声
     # actions_m: 随机权重 (1-r)noise + r*actions_gt 加权
@@ -249,28 +250,29 @@ class FlowmatchingActionHead(nn.Module):
 
         if actions_gt is None:
             return self.get_action(fused_tokens, state=state, embodiment_id=embodiment_id)
-        B = fused_tokens.size(0) # 批次大小 B, H, D 
+        B = fused_tokens.size(0) # 批次大小 8
         device = fused_tokens.device
         # 如果没有传入类别ID，默认全0
         if embodiment_id is None:
             embodiment_id = torch.zeros(B, dtype=torch.long, device=device)
 
-        context_tokens = fused_tokens 
+        context_tokens = fused_tokens # [8, 1024, 896]
         if state is not None and self.state_encoder is not None:
-            state_emb = self.state_encoder(state, embodiment_id)  # 对状态进行一次编码 (num_categories, embed_dim)
-            state_emb = state_emb.unsqueeze(1) # (num_categories, 1, embed_dim)
+            state_emb = self.state_encoder(state, embodiment_id)  # [B, 896]
+            state_emb = state_emb.unsqueeze(1) # [8, 896]->[8, 1, 896]
             context_tokens = torch.cat([context_tokens, state_emb], dim=1) ## state 编码以后和context_tokens拼接
-
+            # [8, 1024+1, 896]
         t = torch.distributions.Beta(2, 2).sample((B,)).clamp(0.02, 0.98).to(device).to(dtype=self.dtype)
         # 维度是[B],每个数都在[0.02,0.98]之间
-        # t = [t1, .... , tB]
+        # t = [t1, .... , t8]
         time_index = (t * 1000).long() # 得到的是[B],但是数值在[2,980]之间，可以理解为B个索引值
-        time_emb = self.time_pos_enc(1000)[:, time_index, :].squeeze(0) ## 时间在这里
-        # 为 0~999 这 1000 个离散时间步，分别生成一个 embed_dim 维的时间向量[1,1000,embed_dim] 
+        time_emb = self.time_pos_enc(1000)[:, time_index, :].squeeze(0) ## [B, 896]
+        # 为 0~999 这 1000 个离散时间步，分别生成一个 896 维的时间向量[1, 1000, 896] 
         # ->依据索引选->[1,B,embed_dim]->[B,embed_dim] 筛选出了这B个时间步的对应时间向量
+        # 对于896这个向量，计算公式就是transformer 中的计算公式，只不过把dmodel替换为896，把pos替换为对应的时间步
         action_shape = actions_gt.shape[1]  # B H D
         actions_gt_seq = actions_gt # 真实动作（标签）
-        noise = torch.rand_like(actions_gt) * 2 - 1 #actions_gt 形状完全一样的张量，每个值[-1,1]，
+        noise = torch.rand_like(actions_gt) * 2 - 1 #[8, 50, 24]，每个值[-1,1]，
         # B H D
         if action_mask is not None:
             action_mask = action_mask.to(dtype=noise.dtype, device=noise.device) # type 是统一数据类型，例如float32
@@ -278,8 +280,8 @@ class FlowmatchingActionHead(nn.Module):
             noise = noise * action_mask # 对noise 进行mask操作，让噪声只在部分位置生效
 
         if self.horizon > 1:
-            noise_seq = noise.view(B, self.horizon, self.per_action_dim)
-            t_broadcast = t.view(B, 1, 1) ## 随机时间
+            noise_seq = noise.view(B, self.horizon, self.per_action_dim) #维度不变，还是[8, 50, 24]，这里只是做一个显示约束
+            t_broadcast = t.view(B, 1, 1) ## 随机时间，维度从[8]->[8, 1, 1]
         else:
             noise_seq = noise.unsqueeze(1)
             t_broadcast = t.view(B, 1)
@@ -293,26 +295,28 @@ class FlowmatchingActionHead(nn.Module):
         # t 属于 (0.02,0.98)  noise_seq1 随机产生
         if self.horizon > 1 and self.action_encoder is not None: 
             action_tokens = self.action_encoder(action_intermediate_seq, embodiment_id)  
+            # [8, 50, 24] -> [8, 50, 896]
         else:
             if not hasattr(self, "single_action_proj"):
                 self.single_action_proj = nn.Linear(self.per_action_dim, self.embed_dim).to(device)
             action_tokens = self.single_action_proj(action_intermediate_seq) 
-        # action_intermediate_seq 为 B H D
-        # action_tokens  为 B H D1，每一行对应的t 都不一样， time_emb 为  B H time_emb, 每一行都是对这个t整数化后计算得到的时间向量
+
         x = action_tokens
         for block in self.transformer_blocks:
             x = block(x, context_tokens, time_emb) ## 中间态 真实态对应的上下文信息 中间态对应的时间点
-
-        x = self.norm_out(x)  
-
+        # context_tokens [8, 1024+1, 896] image prompt state
+        x = self.norm_out(x)
+        # x.shape = [8, 50, 896]
         if self.horizon > 1:
             x_flat = x.reshape(B, -1)  
             if not hasattr(self, "seq_pool_proj"):
                 self.seq_pool_proj = nn.Linear(self.horizon * self.embed_dim, self.embed_dim).to(device)
-            x_pooled = self.seq_pool_proj(x_flat)  
+            x_pooled = self.seq_pool_proj(x_flat)
+        # [8, 50 * 896] -> [8, 896] 
         else:          
             x_pooled = x.squeeze(1) 
         pred_velocity = self.mlp_head(x_pooled, embodiment_id) ## 预测速度
+        # [8, 896] -> [8, 24] 
         return pred_velocity, noise
         # noise 是起点
         # actions_gt 是终点

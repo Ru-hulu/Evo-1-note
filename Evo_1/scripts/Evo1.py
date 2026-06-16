@@ -32,23 +32,23 @@ class EVO1(nn.Module):
             
             if action_dim != horizon * per_action_dim:
                 raise ValueError(f"action_dim ({action_dim}) ≠ horizon ({horizon}) × per_action_dim ({per_action_dim})")
-            
+
             self.horizon = horizon
             self.per_action_dim = per_action_dim
-            
+
             self.action_head = FlowmatchingActionHead(config=SimpleNamespace(
-                embed_dim=config.get("embed_dim", 896),    
-                hidden_dim=config.get("hidden_dim", 1024),
-                action_dim=action_dim,
-                horizon=horizon,
-                per_action_dim=per_action_dim,
-                state_dim=config.get("state_dim", 7),
-                state_hidden_dim=config.get("state_hidden_dim", 1024),
-                num_heads=config.get("num_heads", 8),
-                num_layers=config.get("num_layers", 8),
-                dropout=config.get("dropout", 0.0),
-                num_inference_timesteps=config.get("num_inference_timesteps", 50),
-                num_categories=config.get("num_categories", 1)
+                embed_dim=config.get("embed_dim", 896),  # README MetaWorld: 896
+                hidden_dim=config.get("hidden_dim", 1024),  # README MetaWorld: 1024
+                action_dim=action_dim,  # README MetaWorld: 50 * 24 = 1200
+                horizon=horizon,  # README MetaWorld: 50
+                per_action_dim=per_action_dim,  # README MetaWorld: 24
+                state_dim=config.get("state_dim", 7),  # README MetaWorld: 24
+                state_hidden_dim=config.get("state_hidden_dim", 1024),  # README MetaWorld: 1024
+                num_heads=config.get("num_heads", 8),  # README MetaWorld: 8
+                num_layers=config.get("num_layers", 8),  # README MetaWorld: 8
+                dropout=config.get("dropout", 0.0),  # README MetaWorld stage1/stage2: 0.2
+                num_inference_timesteps=config.get("num_inference_timesteps", 50),  # README MetaWorld: 50
+                num_categories=config.get("num_categories", 1)  # README MetaWorld: 1
             )).to(self._device)
         else:
             raise NotImplementedError(f"Unknown action_head: {action_head_type}")

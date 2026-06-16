@@ -63,7 +63,7 @@ def inspect_named_submodules(module_dict: dict, verbose: bool = True):
     logging.info(f"ALL FROZEN    : {(total_all - trainable_all) / 1e6:.2f}M")
     logging.info("=" * 70)
 
-
+# 打包器，将多个样本组装为一个batch
 def custom_collate_fn(batch):
     prompts = [item["prompt"] for item in batch]
     images = [item["images"] for item in batch]
@@ -366,6 +366,7 @@ def train(config):
     
     
     # === Warmup + Cosine Scheduler ===
+    # 训练刚开始时，模型参数还不稳定，如果一上来就用完整学习率，可能训练震荡。warmup 会让学习率从很小慢慢升到设定的 lr。
     max_steps = get_with_warning(config, "max_steps", 1000)
     warmup_steps = get_with_warning(config, "warmup_steps", 300)
     
@@ -389,7 +390,7 @@ def train(config):
 
     if resume != bool(resume_path):
         raise ValueError("Inconsistent resume configuration: --resume and --resume_path must be set together.")
-    
+    # 之前如果训练停止，从某个checkpoint 开始继续训练。
     if resume:
         resume_path = resume_path.rstrip("/")
         resume_dir, resume_tag = os.path.split(resume_path)
@@ -430,27 +431,28 @@ def train(config):
         for batch in tqdm(dataloader, desc="Training", disable=not accelerator.is_main_process):
             if step >= max_steps:
                 break
-            prompts = batch["prompts"]
-            images_batch = batch["images"]
-            image_masks = batch["image_masks"]
-            states = batch["states"].to(dtype=torch.bfloat16)
-            actions_gt = batch["actions"].to(dtype=torch.bfloat16)
+            prompts = batch["prompts"] # len(prompts) = 8
+            images_batch = batch["images"] # images_batch[i].shape = [3, 3, 448, 448]
+            image_masks = batch["image_masks"] # images_batch[i].shape = [3, 3, 448, 448]
+            states = batch["states"].to(dtype=torch.bfloat16) # states.shape = [8, 24]
+            actions_gt = batch["actions"].to(dtype=torch.bfloat16)#  = [8, 50, 24]
             action_mask = batch["action_mask"]
             state_mask = batch["state_mask"]
             embodiment_ids = batch["embodiment_ids"]
             fused_tokens_list = []
             
             for prompt, images, image_mask in zip(prompts, images_batch, image_masks):
+                # images.shape = [3, 3, 448, 448]
                 fused = model.get_vl_embeddings(images=images, image_mask=image_mask, prompt=prompt, return_cls_only=False)
+                # 对应论文中输出Qwen的结果，维度是1-1024-896
                 fused_tokens_list.append(fused.to(dtype=torch.bfloat16))
-                # inter 模型输出的结果，将image 和 text的token进行融合。
-            fused_tokens = torch.cat(fused_tokens_list, dim=0)
-
+                # [3,1024,896]
+            fused_tokens = torch.cat(fused_tokens_list, dim=0)# [8, 1024, 896]
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # 这里开始作前向传播了
                 pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask)
                 # 输入 语义信息，机器人的状态，真实动作
-                # 输出 从随机noise到actions_gt两者的中间状态   下向target移动的 预测速度
+                # 输出 从随机noise到actions_gt两者的中间状态下 向target移动的 预测速度
                 # 这里注意，虽然噪声 和 中间状态也是随机的(x_in = t*noise + (1-t)*action_gt) 每个随机噪声对应的t都是随机的
                 # 但是同一个噪声生成的所有 中间状态，对应的target_v都是一样的
                 # x_noise(随机生成的) ->x_in1(对应随机t1) ->x_in2(对应随机t2) -> ... ->x_in(tk) -> ...-> x_gt

@@ -418,7 +418,7 @@ class LeRobotDataset(Dataset):
             
         return padded_tensor, mask
 
-
+    # 给定一个时间戳，从视频中获取对应的图像
     def _load_video_frame(self, video_paths: dict, timestamp: float) -> List[Image.Image]:
     
         frames = []
@@ -526,7 +526,7 @@ class LeRobotDataset(Dataset):
         image_mask = torch.zeros(self.max_views, dtype=torch.bool)
         image_mask[:num_real_views] = True 
         # 如果这一时间戳对应的image数量比设定少，就通过补空图片的方式来填补
-        while len(images) < self.max_views:
+        while len(images) < self.max_views: # max_views = 3
             if len(images) == 0:
                 dummy_image = torch.zeros(3, 448, 448)
                 logging.info("Warning: Image list is empty, using zero tensor for padding")
@@ -549,7 +549,7 @@ class LeRobotDataset(Dataset):
         state_max = torch.tensor(norm_stats["observation.state"]["max"], dtype=torch.float32, device=device)
         
         state = 2 * (state - state_min) / (state_max - state_min + 1e-8) - 1 ## 将所有的状态都norm到[-1 1]之间
-        state = torch.clamp(state, -1.0, 1.0)  
+        state = torch.clamp(state, -1.0, 1.0)
 
         state_padded, state_mask = self._pad_tensor(
             state, self.max_state_dim
