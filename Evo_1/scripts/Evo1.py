@@ -1,6 +1,7 @@
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "voxel_vit_patch_embedding")))
 from types import SimpleNamespace
 from typing import List, Union, Tuple
 from PIL import Image
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 from model.internvl3.internvl3_embedder import InternVL3Embedder
 from model.action_head.flow_matching import FlowmatchingActionHead
+from voxel_vit_patch_embedding import VoxelPatchEmbedding
 import logging
 class EVO1(nn.Module):
     def __init__(self, config: dict):
@@ -17,6 +19,13 @@ class EVO1(nn.Module):
         self.return_cls_only = config.get("return_cls_only", False)
         vlm_name = config.get("vlm_name", "OpenGVLab/InternVL3-1B")
         self.embedder = InternVL3Embedder(model_name=vlm_name, device=self._device)
+        self.voxel_encoder = VoxelPatchEmbedding(
+            in_channels=config.get("voxel_in_channels", 1),
+            embed_dim=config.get("voxel_embed_dim", 256),
+            patch_size=config.get("voxel_patch_size", (17, 23, 11)),
+            grid_size=config.get("voxel_grid_size", (51, 69, 44)),
+            output_dim=config.get("embed_dim", 896),
+        ).to(self._device)
 
         action_head_type = config.get("action_head", "flowmatching").lower()
         
@@ -58,6 +67,7 @@ class EVO1(nn.Module):
         images: List[Image.Image],
         image_mask: torch.Tensor,
         prompt: str = "",
+        voxel: Union[torch.Tensor, None] = None,
         return_cls_only: Union[bool, None] = None
     ) -> torch.Tensor:
 
@@ -66,11 +76,21 @@ class EVO1(nn.Module):
 
         if images is None or len(images) == 0:
             raise ValueError("Must provide at least one image (PIL.Image). Got `images=None` or empty list.")
+        voxel_tokens = None
+        if voxel is not None:
+            voxel = voxel.unsqueeze(0).unsqueeze(0) # [X, Y, Z] -> [1, 1, X, Y, Z]
+            voxel = voxel.to(
+                device=self._device,
+                dtype=next(self.voxel_encoder.parameters()).dtype,
+            )
+            voxel_tokens = self.voxel_encoder(voxel)
+
         return self.embedder.get_fused_image_text_embedding_from_tensor_images(
             image_tensors=images,
             image_mask=image_mask,
             text_prompt=prompt,
             return_cls_only=return_cls_only,
+            extra_tokens=voxel_tokens,
         )
 
     def prepare_state(self, state_input: Union[list, torch.Tensor]) -> torch.Tensor:

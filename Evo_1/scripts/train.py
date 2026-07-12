@@ -68,6 +68,7 @@ def custom_collate_fn(batch):
     prompts = [item["prompt"] for item in batch]
     images = [item["images"] for item in batch]
     states = torch.stack([item["state"] for item in batch], dim=0)
+    voxel = torch.stack([item["voxel"] for item in batch], dim=0)
     actions = torch.stack([item["action"] for item in batch], dim=0)
     action_mask = torch.stack([item["action_mask"] for item in batch], dim=0)
     image_masks = torch.stack([item["image_mask"] for item in batch], dim=0)
@@ -78,6 +79,7 @@ def custom_collate_fn(batch):
         "prompts": prompts,
         "images": images,
         "states": states,
+        "voxel": voxel,
         "actions": actions,
         "action_mask": action_mask,
         "state_mask": state_mask,
@@ -423,6 +425,7 @@ def train(config):
         inspect_named_submodules({
             "vision_model": model.embedder.model.vision_model,
             "language_model": model.embedder.model.language_model,
+            "voxel_encoder": model.voxel_encoder,
             "action_head": model.action_head
         })
 
@@ -434,6 +437,7 @@ def train(config):
             prompts = batch["prompts"] # len(prompts) = 8
             images_batch = batch["images"] # images_batch[i].shape = [3, 3, 448, 448]
             image_masks = batch["image_masks"] # images_batch[i].shape = [3, 3, 448, 448]
+            voxel = batch["voxel"].to(dtype=torch.bfloat16)
             states = batch["states"].to(dtype=torch.bfloat16) # states.shape = [8, 24]
             actions_gt = batch["actions"].to(dtype=torch.bfloat16)#  = [8, 50, 24]
             action_mask = batch["action_mask"]
@@ -441,13 +445,14 @@ def train(config):
             embodiment_ids = batch["embodiment_ids"]
             fused_tokens_list = []
             
-            for prompt, images, image_mask in zip(prompts, images_batch, image_masks):
+            for prompt, images, image_mask, voxel_sample in zip(prompts, images_batch, image_masks, voxel):
                 # images.shape = [3, 3, 448, 448]
-                fused = model.get_vl_embeddings(images=images, image_mask=image_mask, prompt=prompt, return_cls_only=False)
-                # 对应论文中输出Qwen的结果，维度是1-1024-896
+                # voxel_sample.shape = [51, 69, 44]
+                fused = model.get_vl_embeddings(images=images, image_mask=image_mask, prompt=prompt, voxel=voxel_sample, return_cls_only=False)
+                # 对应论文中输出Qwen的结果，加入 voxel token 后维度是 [1, 1024 + N_voxel, 896]
                 fused_tokens_list.append(fused.to(dtype=torch.bfloat16))
-                # [3,1024,896]
-            fused_tokens = torch.cat(fused_tokens_list, dim=0)# [8, 1024, 896]
+                # [1, 1024 + N_voxel, 896]
+            fused_tokens = torch.cat(fused_tokens_list, dim=0)# [8, 1024 + N_voxel, 896]
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # 这里开始作前向传播了
                 pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask)
@@ -600,4 +605,3 @@ if __name__ == "__main__":
         if accelerator.is_main_process:
             logging.info("KeyboardInterrupt received. Cleaning up...")
         sys.exit(0)
-

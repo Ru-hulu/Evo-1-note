@@ -257,6 +257,7 @@ class InternVL3Embedder(nn.Module):
         image_mask: torch.Tensor,
         text_prompt: str,
         return_cls_only: bool = True,
+        extra_tokens: Union[torch.Tensor, None] = None,
     ):
 
         # pixel_values → shape = (13, 3, 448, 448)
@@ -279,6 +280,20 @@ class InternVL3Embedder(nn.Module):
         prompt = self._build_multimodal_prompt(num_tiles_list, text_prompt) # 图像占位符 + 文字prompt
         inputs_embeds, attention_mask = self._prepare_and_fuse_embeddings(prompt, fused_embeds, image_mask, num_tiles_list)
         # 文本 token + 图像 token → 拼在一起 → 变成 LLM 能看懂的输入 embedding
+        if extra_tokens is not None:
+            extra_tokens = extra_tokens.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            if extra_tokens.ndim != 3 or extra_tokens.shape[0] != inputs_embeds.shape[0]:
+                raise ValueError(
+                    "extra_tokens must have shape [B, N, C] and match inputs_embeds batch size, "
+                    f"got extra_tokens={tuple(extra_tokens.shape)}, inputs_embeds={tuple(inputs_embeds.shape)}"
+                )
+            extra_attention_mask = torch.ones(
+                extra_tokens.shape[:2],
+                device=attention_mask.device,
+                dtype=attention_mask.dtype,
+            )
+            inputs_embeds = torch.cat([inputs_embeds, extra_tokens], dim=1)
+            attention_mask = torch.cat([attention_mask, extra_attention_mask], dim=1)
         outputs = self.model.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
