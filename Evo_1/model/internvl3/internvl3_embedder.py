@@ -173,7 +173,8 @@ class InternVL3Embedder(nn.Module):
         prompt: str,
         vit_embeds: torch.Tensor,
         image_mask: torch.Tensor,
-        num_tiles_list: List[int]
+        num_tiles_list: List[int],
+        voxel_tokens: torch.Tensor, # [1, N_voxel, 896]
     ) -> (torch.Tensor, torch.Tensor):
    
         untruncated_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
@@ -248,6 +249,17 @@ class InternVL3Embedder(nn.Module):
         torch.set_printoptions(profile="full", threshold=float('inf'))
      
         torch.set_printoptions(profile="default")
+        voxel_label_inputs = self.tokenizer("Robot geometry:\n", return_tensors="pt", add_special_tokens=False).to(self.device)
+        voxel_label_embeds = self.model.language_model.get_input_embeddings()(voxel_label_inputs["input_ids"])
+        voxel_label_mask = voxel_label_inputs["attention_mask"]
+        voxel_tokens = voxel_tokens.to(device=input_embeds.device, dtype=input_embeds.dtype)
+        voxel_attention_mask = torch.ones(
+            voxel_tokens.shape[:2],
+            device=attention_mask.device,
+            dtype=attention_mask.dtype,
+        ) # 拿到 [1, Nvoxel] 维度的全1矩阵，表示每个voxel 都有用
+        input_embeds = torch.cat([input_embeds, voxel_label_embeds, voxel_tokens], dim=1)
+        attention_mask = torch.cat([attention_mask, voxel_label_mask, voxel_attention_mask], dim=1)
         return input_embeds, attention_mask
 
 
@@ -257,7 +269,7 @@ class InternVL3Embedder(nn.Module):
         image_mask: torch.Tensor,
         text_prompt: str,
         return_cls_only: bool = True,
-        extra_tokens: Union[torch.Tensor, None] = None,
+        voxel_tokens: torch.Tensor = None,
     ):
 
         # pixel_values → shape = (13, 3, 448, 448)
@@ -278,22 +290,8 @@ class InternVL3Embedder(nn.Module):
         fused_embeds = vit_embeds # 图像被提取出来的特征信息
         # 图像ViT提取出来的特征 (总块数×256, 块数就是前面切的，256就是_build_multimodal_prompt中的num_image_token)
         prompt = self._build_multimodal_prompt(num_tiles_list, text_prompt) # 图像占位符 + 文字prompt
-        inputs_embeds, attention_mask = self._prepare_and_fuse_embeddings(prompt, fused_embeds, image_mask, num_tiles_list)
+        inputs_embeds, attention_mask = self._prepare_and_fuse_embeddings(prompt, fused_embeds, image_mask, num_tiles_list, voxel_tokens)
         # 文本 token + 图像 token → 拼在一起 → 变成 LLM 能看懂的输入 embedding
-        if extra_tokens is not None:
-            extra_tokens = extra_tokens.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-            if extra_tokens.ndim != 3 or extra_tokens.shape[0] != inputs_embeds.shape[0]:
-                raise ValueError(
-                    "extra_tokens must have shape [B, N, C] and match inputs_embeds batch size, "
-                    f"got extra_tokens={tuple(extra_tokens.shape)}, inputs_embeds={tuple(inputs_embeds.shape)}"
-                )
-            extra_attention_mask = torch.ones(
-                extra_tokens.shape[:2],
-                device=attention_mask.device,
-                dtype=attention_mask.dtype,
-            )
-            inputs_embeds = torch.cat([inputs_embeds, extra_tokens], dim=1)
-            attention_mask = torch.cat([attention_mask, extra_attention_mask], dim=1)
         outputs = self.model.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,

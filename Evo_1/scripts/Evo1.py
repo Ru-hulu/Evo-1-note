@@ -90,7 +90,7 @@ class EVO1(nn.Module):
             image_mask=image_mask,
             text_prompt=prompt,
             return_cls_only=return_cls_only,
-            extra_tokens=voxel_tokens,
+            voxel_tokens=voxel_tokens,
         )
 
     def prepare_state(self, state_input: Union[list, torch.Tensor]) -> torch.Tensor:
