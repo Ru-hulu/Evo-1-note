@@ -287,7 +287,7 @@ def load_checkpoint_with_deepspeed(model_engine, load_dir, accelerator, tag="ste
                 logging.error(f"Failed to load checkpoint even without optimizer states: {str(e2)}")
             raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {load_dir} with tag {tag}: {str(e2)}")
 
-    
+
 
 def get_and_clip_grad_norm(accelerator, model, loss, max_norm: float = 1.0):
 
