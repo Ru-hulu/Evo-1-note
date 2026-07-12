@@ -22,6 +22,69 @@ import pickle
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+class RobotVoxelizer:
+    def __init__(self):
+        self._libero_runtime_ready = False
+
+    def __call__(self, raw_state, arm_key):
+        if "libero" not in str(arm_key).lower():
+            return None
+
+        self._prepare_libero_voxel_runtime()
+        raw_state_arr = np.asarray(raw_state, dtype=np.float32)
+        arm_joint_names = [str(name) for name in self._libero_voxel_cache["arm_joint_names"]]
+        if len(raw_state_arr) < len(arm_joint_names):
+            raise ValueError(
+                f"LIBERO state has {len(raw_state_arr)} dims, "
+                f"but {len(arm_joint_names)} arm joints are required for voxel generation."
+            )
+
+        voxel_state = {
+            joint_name: float(raw_state_arr[joint_idx])
+            for joint_idx, joint_name in enumerate(arm_joint_names)
+        }
+        if len(raw_state_arr) > len(arm_joint_names):
+            voxel_state["gripper_open"] = float(raw_state_arr[len(arm_joint_names)])
+
+        base_points = self._states_to_base_points(
+            self._libero_voxel_cache,
+            voxel_state,
+            base_pos=self._libero_base_pos,
+        )
+        bounded_voxel = self._crop_base_points_to_workspace(
+            base_points["points"],
+            base_points["link_ids"],
+            self._libero_workspace_bounds,
+        )
+        return torch.from_numpy(bounded_voxel["occupancy"].astype(np.float32))
+
+    def _prepare_libero_voxel_runtime(self):
+        if self._libero_runtime_ready:
+            return
+
+        import sys
+
+        voxel_root = Path(__file__).resolve().parents[2] / "libero_voxel_realtime"
+        if str(voxel_root) not in sys.path:
+            sys.path.insert(0, str(voxel_root))
+
+        from common.workspace import (
+            DEFAULT_BASE_POS,
+            DEFAULT_WORKSPACE_BOUNDS,
+            VOXEL_SIZE,
+            bounds_to_grid_edges,
+            crop_base_points_to_workspace,
+        )
+        from standalone.bounded_robot_voxel import load_standalone_cache, states_to_base_points
+
+        lower_edge, upper_edge = bounds_to_grid_edges(DEFAULT_WORKSPACE_BOUNDS)
+        self._libero_workspace_bounds = np.stack([lower_edge, upper_edge], axis=1).astype(np.float32) * VOXEL_SIZE
+        self._libero_base_pos = DEFAULT_BASE_POS
+        self._libero_voxel_cache = load_standalone_cache()
+        self._states_to_base_points = states_to_base_points
+        self._crop_base_points_to_workspace = crop_base_points_to_workspace
+        self._libero_runtime_ready = True
+
 def compute_lerobot_normalization_stats_from_minmax(jsonl_path):
     state_mins, state_maxs = [], []
     action_mins, action_maxs = [], []
@@ -201,6 +264,7 @@ class LeRobotDataset(Dataset):
         self.max_samples_per_file = max_samples_per_file
         self.binarize_gripper = binarize_gripper
         self.use_augmentation = use_augmentation
+        self.voxelizer = RobotVoxelizer()
 
 
         if cache_dir is None:
@@ -543,7 +607,10 @@ class LeRobotDataset(Dataset):
         except KeyError:
             raise KeyError(f"Normalization stats not found for arm_key={arm_key} and dataset_key={dataset_key}")
 
-        state = torch.tensor(item["state"], dtype=torch.float32)
+        raw_state = item["state"]
+        # voxel 应该在这里根据 raw_state 计算；此时 state 还没有归一化，也没有 padding。
+        voxel = self.voxelizer(raw_state, arm_key)
+        state = torch.tensor(raw_state, dtype=torch.float32)
         device = state.device
         state_min = torch.tensor(norm_stats["observation.state"]["min"], dtype=torch.float32, device=device)
         state_max = torch.tensor(norm_stats["observation.state"]["max"], dtype=torch.float32, device=device)
@@ -583,6 +650,6 @@ class LeRobotDataset(Dataset):
             "state_mask": state_mask,
             "action": action_padded.to(dtype=torch.bfloat16),
             "action_mask": action_mask,
+            "voxel": voxel,
             "embodiment_id": torch.tensor(embodiment_id, dtype=torch.long)
         }
-
